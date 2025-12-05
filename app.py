@@ -1,7 +1,7 @@
 import io
 import json
 import re
-from urllib.parse import urlparse, urljoin
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -26,7 +26,7 @@ Paste a **dispensary website or menu link** below.
 The app will:
 
 - Auto-detect the menu engine (**Dutchie, Jane, Weedmaps, Dispense, Tymber, or Generic**)
-- Try to scrape products (name, price, THC when possible)
+- Try to scrape products (Product, Price, THC where possible)
 - Let you scan multiple dispensaries and export everything to **Excel**
 """
 )
@@ -40,7 +40,7 @@ if "all_competitors" not in st.session_state:
 # -------------------------
 
 
-def fetch_html(url, timeout=20):
+def fetch_html(url: str, timeout: int = 20) -> str | None:
     """
     Fetch raw HTML for a URL, with a desktop user agent.
     """
@@ -60,7 +60,7 @@ def fetch_html(url, timeout=20):
         return None
 
 
-def detect_engine(url, html):
+def detect_engine(url: str, html: str) -> str:
     """
     Auto-detect which ecommerce engine is backing this menu.
     Returns one of: 'dutchie', 'jane', 'weedmaps', 'dispense', 'tymber', 'generic'
@@ -100,16 +100,16 @@ def detect_engine(url, html):
 # -------------------------
 
 
-def parse_products_from_jsonld(html, category_hint=None):
+def parse_products_from_jsonld(html: str, category_hint: str | None = None) -> pd.DataFrame:
     """
     Look for <script type="application/ld+json"> blocks and pull out
     basic Product / Offer info where available.
-    Returns a DataFrame with columns: Product, Price, THC (if found)
+    Returns a DataFrame with columns: Product, Category, Price, THC, Source
     """
     soup = BeautifulSoup(html, "html.parser")
     scripts = soup.find_all("script", type="application/ld+json")
 
-    rows = []
+    rows: list[dict] = []
 
     for tag in scripts:
         raw = tag.string
@@ -121,7 +121,6 @@ def parse_products_from_jsonld(html, category_hint=None):
         except Exception:
             continue
 
-        # Normalize to list
         items = data if isinstance(data, list) else [data]
 
         for item in items:
@@ -130,7 +129,6 @@ def parse_products_from_jsonld(html, category_hint=None):
 
             item_type = item.get("@type") or item.get("type")
 
-            # Direct Product
             if isinstance(item_type, str) and "product" in item_type.lower():
                 name = item.get("name")
 
@@ -144,7 +142,7 @@ def parse_products_from_jsonld(html, category_hint=None):
                     except ValueError:
                         price = None
 
-                # Try to pull THC from additionalProperty
+                # THC from additionalProperty
                 thc_val = None
                 add_props = item.get("additionalProperty") or item.get(
                     "additionalProperties"
@@ -185,14 +183,13 @@ def parse_products_from_jsonld(html, category_hint=None):
     return df
 
 
-def extract_generic_cards(soup, category_hint=None):
+def extract_generic_cards(soup: BeautifulSoup, category_hint: str | None = None) -> pd.DataFrame:
     """
     Super-generic fallback parser for HTML card grids.
     Tries to infer product name, price, and THC.
     """
-    rows = []
+    rows: list[dict] = []
 
-    # Heuristic selectors. Easy to expand if we see new patterns.
     selectors = [
         "[class*='product-card']",
         "[class*='ProductCard']",
@@ -251,43 +248,37 @@ def extract_generic_cards(soup, category_hint=None):
 
 
 # -------------------------
-# Engine-specific stubs
+# Engine-specific stubs (safe, no hard-coded APIs)
 # -------------------------
 
 
-def fetch_menu_dutchie(url, html):
+def fetch_menu_dutchie(url: str, html: str) -> pd.DataFrame:
     """
     Dutchie menus: either a direct dutchie.com link, or a marketing site
     that embeds Dutchie via dtche[...] / iframe.
 
-    Right now this uses a generic HTML/JSON-LD pass on the best Dutchie-like URL
-    we can find, so the app stays usable. Later you can upgrade this to call
-    Dutchie's JSON / GraphQL endpoints directly.
+    This version does NOT call any hard-coded Dutchie API endpoint.
+    It:
+      1) Uses the original URL (or an embedded dutchie URL if you later add that)
+      2) Tries JSON-LD
+      3) Falls back to generic HTML card parsing
     """
-    # Try to find a dutchie URL inside the HTML
-    m = re.search(r'https?://[^"\'\s]*dutchie[^"\'\s]*', html, re.I)
-    dutchie_url = m.group(0) if m else url
-
-    dutchie_html = fetch_html(dutchie_url)
-    if not dutchie_html:
-        return pd.DataFrame()
+    dutchie_html = html  # for now just reuse the same HTML we fetched
 
     soup = BeautifulSoup(dutchie_html, "html.parser")
 
-    # 1) Try JSON-LD
     df_ld = parse_products_from_jsonld(dutchie_html)
     if not df_ld.empty:
         return df_ld
 
-    # 2) Fallback: generic cards
     df_cards = extract_generic_cards(soup)
     if not df_cards.empty:
         return df_cards
 
-    return pd.DataFrame()
+    return pd.DataFrame(columns=["Product", "Category", "Price", "THC", "Source"])
 
 
-def fetch_menu_jane(url, html):
+def fetch_menu_jane(url: str, html: str) -> pd.DataFrame:
     """
     Jane / iHeartJane stub.
     For now we lean on JSON-LD and generic cards.
@@ -300,7 +291,7 @@ def fetch_menu_jane(url, html):
     return df_cards
 
 
-def fetch_menu_weedmaps(url, html):
+def fetch_menu_weedmaps(url: str, html: str) -> pd.DataFrame:
     """
     Weedmaps stub.
     """
@@ -312,7 +303,7 @@ def fetch_menu_weedmaps(url, html):
     return df_cards
 
 
-def fetch_menu_dispense(url, html):
+def fetch_menu_dispense(url: str, html: str) -> pd.DataFrame:
     """
     Dispense / similar engines stub.
     """
@@ -324,7 +315,7 @@ def fetch_menu_dispense(url, html):
     return df_cards
 
 
-def fetch_menu_tymber(url, html):
+def fetch_menu_tymber(url: str, html: str) -> pd.DataFrame:
     """
     Tymber stub.
     """
@@ -336,7 +327,7 @@ def fetch_menu_tymber(url, html):
     return df_cards
 
 
-def fetch_menu_generic(url, html):
+def fetch_menu_generic(url: str, html: str) -> pd.DataFrame:
     """
     Generic fallback: JSON-LD first, then HTML cards on the exact URL.
     """
@@ -353,13 +344,12 @@ def fetch_menu_generic(url, html):
 # -------------------------
 
 
-def fetch_competitor_menu(url):
+def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
     """
     Given ANY menu/website URL, auto-detect the engine and route to
     the right scraper.
 
-    Returns (df, engine) where df has at least:
-    ['Product', 'Price', 'THC', 'Category', 'Source']
+    Returns (df, engine)
     """
     html = fetch_html(url)
     if not html:
@@ -388,7 +378,7 @@ def fetch_competitor_menu(url):
 # -------------------------
 
 
-def make_excel_bytes(df):
+def make_excel_bytes(df: pd.DataFrame) -> bytes:
     """
     Convert a DataFrame to an in-memory Excel file.
     """
@@ -454,7 +444,6 @@ if submitted and url.strip():
         with st.expander("Preview rows from this scan"):
             st.dataframe(df.head(50), use_container_width=True)
 
-
 st.markdown("---")
 st.subheader("Combined Competitor Table (all scans this session)")
 
@@ -480,7 +469,7 @@ else:
     )
     col3.metric(
         "Average Price (All)",
-        f"${avg_price:,.2f}" if avg_price and not pd.isna(avg_price) else "N/A",
+        f"${avg_price:,.2f}" if avg_price is not None and not pd.isna(avg_price) else "N/A",
     )
 
     excel_bytes = make_excel_bytes(combined)
