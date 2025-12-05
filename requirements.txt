@@ -3,3 +3,6 @@ pandas
 requests
 beautifulsoup4
 xlsxwriter
+playwright
+pillow
+pytesseract
