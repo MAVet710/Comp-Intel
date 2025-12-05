@@ -8,6 +8,11 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
+from io import BytesIO
+from PIL import Image
+import pytesseract
+from playwright.sync_api import sync_playwright
+
 # -------------------------
 # Streamlit page config
 # -------------------------
@@ -27,6 +32,7 @@ The app will:
 
 - Auto-detect the menu engine (**Dutchie, Jane, Weedmaps, Dispense, Tymber, or Generic**)
 - Try to scrape products (Product, Price, THC where possible)
+- If that fails on JS-heavy menus (Dutchie / Jane / Weedmaps), it will try an **OCR screenshot fallback**
 - Let you scan multiple dispensaries and export everything to **Excel**
 """
 )
@@ -40,7 +46,7 @@ if "all_competitors" not in st.session_state:
 # -------------------------
 
 
-def fetch_html(url: str, timeout: int = 20) -> str | None:
+def fetch_html(url, timeout=20):
     """
     Fetch raw HTML for a URL, with a desktop user agent.
     """
@@ -60,7 +66,7 @@ def fetch_html(url: str, timeout: int = 20) -> str | None:
         return None
 
 
-def detect_engine(url: str, html: str) -> str:
+def detect_engine(url, html):
     """
     Auto-detect which ecommerce engine is backing this menu.
     Returns one of: 'dutchie', 'jane', 'weedmaps', 'dispense', 'tymber', 'generic'
@@ -96,11 +102,11 @@ def detect_engine(url: str, html: str) -> str:
 
 
 # -------------------------
-# Generic parsers
+# Generic parsers (HTML / JSON-LD)
 # -------------------------
 
 
-def parse_products_from_jsonld(html: str, category_hint: str | None = None) -> pd.DataFrame:
+def parse_products_from_jsonld(html, category_hint=None):
     """
     Look for <script type="application/ld+json"> blocks and pull out
     basic Product / Offer info where available.
@@ -109,7 +115,7 @@ def parse_products_from_jsonld(html: str, category_hint: str | None = None) -> p
     soup = BeautifulSoup(html, "html.parser")
     scripts = soup.find_all("script", type="application/ld+json")
 
-    rows: list[dict] = []
+    rows = []
 
     for tag in scripts:
         raw = tag.string
@@ -183,12 +189,12 @@ def parse_products_from_jsonld(html: str, category_hint: str | None = None) -> p
     return df
 
 
-def extract_generic_cards(soup: BeautifulSoup, category_hint: str | None = None) -> pd.DataFrame:
+def extract_generic_cards(soup, category_hint=None):
     """
     Super-generic fallback parser for HTML card grids.
     Tries to infer product name, price, and THC.
     """
-    rows: list[dict] = []
+    rows = []
 
     selectors = [
         "[class*='product-card']",
@@ -248,23 +254,135 @@ def extract_generic_cards(soup: BeautifulSoup, category_hint: str | None = None)
 
 
 # -------------------------
-# Engine-specific stubs (safe, no hard-coded APIs)
+# OCR-based fallback (screenshot + OCR)
 # -------------------------
 
 
-def fetch_menu_dutchie(url: str, html: str) -> pd.DataFrame:
+def screenshot_page(url):
+    """
+    Use a headless browser (Playwright) to render the page and take
+    a full-page PNG screenshot. Returns raw bytes or None on failure.
+    """
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 900})
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            # Basic scroll to trigger lazy loading
+            page.mouse.wheel(0, 5000)
+            page.wait_for_timeout(2000)
+            screenshot_bytes = page.screenshot(full_page=True)
+            browser.close()
+        return screenshot_bytes
+    except Exception as e:
+        st.info(f"OCR fallback could not screenshot the page: {e}")
+        return None
+
+
+def ocr_text_from_image_bytes(img_bytes):
+    """
+    Run OCR on a PNG screenshot and return raw text.
+    """
+    img = Image.open(BytesIO(img_bytes))
+    text = pytesseract.image_to_string(img)
+    return text
+
+
+def parse_products_from_ocr_text(text):
+    """
+    Very rough OCR parser:
+    - Looks for lines that contain a dollar price and some letters
+    - Tries to pull Product, Price, THC
+
+    This will NOT be perfect, but it gives you something to work with.
+    """
+    rows = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # require a price to treat as a product line
+        m_price = re.search(r"\$([\d.,]+)", line)
+        if not m_price:
+            continue
+
+        # need at least one letter
+        if not re.search(r"[A-Za-z]", line):
+            continue
+
+        try:
+            price = float(m_price.group(1).replace(",", ""))
+        except ValueError:
+            price = None
+
+        # THC if present
+        thc = None
+        m_thc = re.search(r"(\d+(\.\d+)?)\s*%?\s*THC", line, re.I)
+        if m_thc:
+            try:
+                thc = float(m_thc.group(1))
+            except ValueError:
+                thc = None
+
+        # product name: line with the price stripped out
+        name_part = line.replace(m_price.group(0), "").strip(" -•|")
+        if not name_part:
+            name_part = line
+
+        rows.append(
+            {
+                "Product": name_part,
+                "Category": None,
+                "Price": price,
+                "THC": thc,
+                "Source": "OCR screenshot",
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["Product", "Category", "Price", "THC", "Source"])
+
+    df = pd.DataFrame(rows)
+    df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+    df["THC"] = pd.to_numeric(df["THC"], errors="coerce")
+    return df
+
+
+def ocr_menu_from_url(url):
+    """
+    Full OCR pipeline:
+      1) Screenshot the page with a headless browser
+      2) OCR the screenshot into text
+      3) Parse that text into a loose product list
+    """
+    screenshot_bytes = screenshot_page(url)
+    if not screenshot_bytes:
+        return pd.DataFrame(columns=["Product", "Category", "Price", "THC", "Source"])
+
+    text = ocr_text_from_image_bytes(screenshot_bytes)
+    df_ocr = parse_products_from_ocr_text(text)
+    return df_ocr
+
+
+# -------------------------
+# Engine-specific stubs (safe, no fragile hard-coded APIs)
+# -------------------------
+
+
+def fetch_menu_dutchie(url, html):
     """
     Dutchie menus: either a direct dutchie.com link, or a marketing site
     that embeds Dutchie via dtche[...] / iframe.
 
     This version does NOT call any hard-coded Dutchie API endpoint.
     It:
-      1) Uses the original URL (or an embedded dutchie URL if you later add that)
+      1) Uses the HTML we already fetched
       2) Tries JSON-LD
       3) Falls back to generic HTML card parsing
     """
-    dutchie_html = html  # for now just reuse the same HTML we fetched
-
+    dutchie_html = html
     soup = BeautifulSoup(dutchie_html, "html.parser")
 
     df_ld = parse_products_from_jsonld(dutchie_html)
@@ -278,7 +396,7 @@ def fetch_menu_dutchie(url: str, html: str) -> pd.DataFrame:
     return pd.DataFrame(columns=["Product", "Category", "Price", "THC", "Source"])
 
 
-def fetch_menu_jane(url: str, html: str) -> pd.DataFrame:
+def fetch_menu_jane(url, html):
     """
     Jane / iHeartJane stub.
     For now we lean on JSON-LD and generic cards.
@@ -291,7 +409,7 @@ def fetch_menu_jane(url: str, html: str) -> pd.DataFrame:
     return df_cards
 
 
-def fetch_menu_weedmaps(url: str, html: str) -> pd.DataFrame:
+def fetch_menu_weedmaps(url, html):
     """
     Weedmaps stub.
     """
@@ -303,7 +421,7 @@ def fetch_menu_weedmaps(url: str, html: str) -> pd.DataFrame:
     return df_cards
 
 
-def fetch_menu_dispense(url: str, html: str) -> pd.DataFrame:
+def fetch_menu_dispense(url, html):
     """
     Dispense / similar engines stub.
     """
@@ -315,7 +433,7 @@ def fetch_menu_dispense(url: str, html: str) -> pd.DataFrame:
     return df_cards
 
 
-def fetch_menu_tymber(url: str, html: str) -> pd.DataFrame:
+def fetch_menu_tymber(url, html):
     """
     Tymber stub.
     """
@@ -327,7 +445,7 @@ def fetch_menu_tymber(url: str, html: str) -> pd.DataFrame:
     return df_cards
 
 
-def fetch_menu_generic(url: str, html: str) -> pd.DataFrame:
+def fetch_menu_generic(url, html):
     """
     Generic fallback: JSON-LD first, then HTML cards on the exact URL.
     """
@@ -340,15 +458,18 @@ def fetch_menu_generic(url: str, html: str) -> pd.DataFrame:
 
 
 # -------------------------
-# Router: any URL -> DataFrame
+# Router: any URL -> DataFrame (with OCR fallback)
 # -------------------------
 
 
-def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
+def fetch_competitor_menu(url):
     """
-    Given ANY menu/website URL, auto-detect the engine and route to
-    the right scraper.
-
+    Given ANY menu/website URL:
+      1) Fetch HTML
+      2) Detect engine
+      3) Use engine-specific / generic HTML parsers
+      4) If no products found and engine looks JS/API-heavy (dutchie/jane/weedmaps),
+         try an OCR screenshot fallback.
     Returns (df, engine)
     """
     html = fetch_html(url)
@@ -357,6 +478,7 @@ def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
 
     engine = detect_engine(url, html)
 
+    # Step 3: normal HTML/JSON parsing
     if engine == "dutchie":
         df = fetch_menu_dutchie(url, html)
     elif engine == "jane":
@@ -370,6 +492,16 @@ def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
     else:
         df = fetch_menu_generic(url, html)
 
+    # Step 4: OCR fallback if HTML parsing found nothing and engine is JS-heavy
+    if df.empty and engine in {"dutchie", "jane", "weedmaps"}:
+        st.info(
+            "No products found in static HTML for this menu. "
+            "Attempting OCR-based screenshot parsing…"
+        )
+        df_ocr = ocr_menu_from_url(url)
+        if not df_ocr.empty:
+            df = df_ocr
+
     return df, engine
 
 
@@ -378,7 +510,7 @@ def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
 # -------------------------
 
 
-def make_excel_bytes(df: pd.DataFrame) -> bytes:
+def make_excel_bytes(df):
     """
     Convert a DataFrame to an in-memory Excel file.
     """
@@ -413,10 +545,15 @@ if submitted and url.strip():
     if df.empty:
         st.warning(
             "No products were detected from this URL. "
-            "This menu may rely on protected APIs or heavy JavaScript."
+            "This menu may rely on protected APIs or complex rendering."
         )
         if engine:
             st.info(f"Detected menu engine: **{engine}**")
+            if engine in {"dutchie", "jane", "weedmaps"}:
+                st.caption(
+                    "Tried HTML/JSON and OCR fallback. For precise data, you may still "
+                    "need a CSV/Excel export from the platform or admin side."
+                )
     else:
         # Normalize basic columns
         if "Price" in df.columns:
@@ -485,4 +622,4 @@ else:
 
     if st.button("Clear all data (this session)"):
         st.session_state["all_competitors"] = pd.DataFrame()
-        st.experimental_rerun()
+        st.rerun()
