@@ -94,11 +94,19 @@ def detect_engine(url: str, html: str) -> str:
     """
     Auto-detect which ecommerce engine is backing this menu.
     Returns one of: 'dutchie', 'jane', 'weedmaps', 'dispense', 'tymber', 'generic'
+
+    Detection priority (highest → lowest):
+      1. Hostname exact matches (dutchie.com, iheartjane.com, weedmaps.com)
+      2. Strong Dutchie signals in HTML: iframe/script src, dtche config, graphql endpoint
+      3. Jane / Weedmaps signals
+      4. Dispense signals (only when no Dutchie signals present)
+      5. Tymber signals
+      6. Generic fallback
     """
     netloc = urlparse(url).netloc.lower()
     lower = html.lower()
 
-    # Direct host hints
+    # 1) Direct host hints (strongest signal)
     if "dutchie" in netloc or "plus.dutchie" in netloc:
         return "dutchie"
     if "iheartjane" in netloc or "jane.menu" in netloc:
@@ -106,19 +114,39 @@ def detect_engine(url: str, html: str) -> str:
     if "weedmaps" in netloc:
         return "weedmaps"
 
-    # Embedded script / iframe hints
-    if "dtche%5bpath%5d" in lower or "dtche[" in lower or "dutchie.com" in lower:
+    # 2) Strong Dutchie signals in HTML (iframe, script, config objects)
+    #    Check multiple patterns: dtche config, dutchie.com src, embedded iframe
+    dutchie_signals = [
+        "dutchie.com",
+        "dtche[",
+        "dtche%5b",
+        '"dtche"',
+        "window.dtche",
+        "dutchie-embed",
+        "dutchie_embed",
+        "plus.dutchie",
+        'src="https://dutchie',
+        "src='https://dutchie",
+        "dutchie/graphql",
+        "menu.dutchie",
+    ]
+    if any(sig in lower for sig in dutchie_signals):
         return "dutchie"
 
+    # 3) Jane / Weedmaps signals
     if "iheartjane.com" in lower or "jane-root" in lower or "data-jane-" in lower:
         return "jane"
 
     if "weedmaps.com" in lower or "wm-menu" in lower:
         return "weedmaps"
 
-    if "dispenseapp" in lower or "dispense.io" in lower:
+    # 4) Dispense signals — only if no Dutchie signals detected above.
+    #    These are HTML content pattern checks for engine detection, not
+    #    security-sensitive URL validation; substring matching is intentional.
+    if "dispenseapp.com" in lower or "dispense.io" in lower or '"dispenseapp"' in lower:
         return "dispense"
 
+    # 5) Tymber signals
     if "tymber" in lower:
         return "tymber"
 
@@ -448,30 +476,24 @@ def ocr_menu_from_url(url: str) -> pd.DataFrame:
 # -------------------------
 
 
-def fetch_menu_dutchie(
-    url: str, html: str, browser_payloads: list | None = None
-) -> pd.DataFrame:
+def fetch_menu_dutchie(url: str, html: str) -> pd.DataFrame:
     """
     Dutchie menus: either a direct dutchie.com link, or a marketing site
     that embeds Dutchie via dtche[...] / iframe.
 
-    Extraction priority:
-      1) Dutchie/GraphQL network payloads captured during a Playwright session
-      2) JSON-LD embedded in the HTML
-      3) Generic HTML card parsing
-    """
-    # 1) Prefer API payloads captured by the browser session
-    if browser_payloads and HAS_BROWSER_HELPERS:
-        df_api = parse_dutchie_responses(browser_payloads)
-        if not df_api.empty:
-            return df_api
+    API/GraphQL payloads are extracted upstream in fetch_competitor_menu before
+    this function is called. This function handles HTML-based fallbacks only.
 
-    # 2) JSON-LD
+    Extraction priority:
+      1) JSON-LD embedded in the HTML
+      2) Generic HTML card parsing
+    """
+    # 1) JSON-LD
     df_ld = parse_products_from_jsonld(html)
     if not df_ld.empty:
         return df_ld
 
-    # 3) Generic HTML cards
+    # 2) Generic HTML cards
     soup = BeautifulSoup(html, "html.parser")
     df_cards = extract_generic_cards(soup)
     if not df_cards.empty:
@@ -548,34 +570,51 @@ def fetch_menu_generic(url: str, html: str) -> pd.DataFrame:
 
 def fetch_competitor_menu(
     url: str, use_browser: bool = False
-) -> tuple[pd.DataFrame, str | None]:
+) -> tuple[pd.DataFrame, str | None, dict]:
     """
     Given ANY menu/website URL:
       1) Fetch HTML (static)
       2) Detect engine
       3) If browser mode requested (or engine is JS-heavy and helpers available),
          use Playwright to render the page, bypass 21+ gates, and capture
-         Dutchie/GraphQL network payloads.
-      4) Use engine-specific / generic HTML parsers
-      5) If no products found and engine looks JS/API-heavy, try OCR fallback.
-    Returns (df, engine)
+         API/GraphQL network payloads.
+      4) Prefer JSON/API payload extraction (Dutchie parser) over HTML parsing.
+      5) If no products found and engine looks JS/API-heavy, try HTML parsers.
+      6) If still empty, try OCR fallback.
+    Returns (df, engine, debug_info)
     """
+    debug_info: dict = {
+        "final_url": url,
+        "engine_initial": None,
+        "engine_final": None,
+        "browser_used": False,
+        "captured_count": 0,
+        "captured_urls": [],
+        "parse_notes": [],
+    }
+
     html = fetch_html(url)
     if not html:
-        return pd.DataFrame(), None
+        return pd.DataFrame(), None, debug_info
 
     engine = detect_engine(url, html)
+    debug_info["engine_initial"] = engine
 
     browser_payloads: list | None = None
 
-    # Decide whether to use the Playwright browser path
-    js_heavy = engine in {"dutchie", "jane", "weedmaps"}
+    # Engines that rely heavily on JS / API calls for menu data
+    js_heavy = engine in {"dutchie", "jane", "weedmaps", "dispense"}
     if (use_browser or js_heavy) and HAS_BROWSER_HELPERS:
         st.info(
             "Using browser mode to render page, bypass 21+ age gate, "
             "and capture API responses…"
         )
         bhtml, browser_payloads, final_url = browser_fetch(url)
+        debug_info["browser_used"] = True
+        debug_info["final_url"] = final_url
+        if browser_payloads:
+            debug_info["captured_count"] = len(browser_payloads)
+            debug_info["captured_urls"] = [p.get("url", "") for p in browser_payloads]
         if bhtml:
             html = bhtml
             # Re-detect engine with the fully rendered HTML / final URL
@@ -583,9 +622,23 @@ def fetch_competitor_menu(
             if detected:
                 engine = detected
 
-    # Engine-specific / generic HTML parsing
+    debug_info["engine_final"] = engine
+
+    # 1) Prefer API/JSON payloads when available (best for Dutchie / JS-heavy menus)
+    if browser_payloads and HAS_BROWSER_HELPERS:
+        df_api = parse_dutchie_responses(browser_payloads)
+        if not df_api.empty:
+            debug_info["parse_notes"].append(
+                f"API extraction found {len(df_api)} products"
+            )
+            return df_api, engine, debug_info
+        debug_info["parse_notes"].append(
+            f"API extraction found 0 products from {len(browser_payloads)} responses"
+        )
+
+    # 2) Engine-specific / generic HTML parsing
     if engine == "dutchie":
-        df = fetch_menu_dutchie(url, html, browser_payloads)
+        df = fetch_menu_dutchie(url, html)
     elif engine == "jane":
         df = fetch_menu_jane(url, html)
     elif engine == "weedmaps":
@@ -597,17 +650,30 @@ def fetch_competitor_menu(
     else:
         df = fetch_menu_generic(url, html)
 
-    # OCR fallback if HTML/API parsing found nothing and engine is JS-heavy
-    if df.empty and js_heavy:
+    if not df.empty:
+        debug_info["parse_notes"].append(
+            f"HTML/JSON-LD extraction found {len(df)} products"
+        )
+        return df, engine, debug_info
+
+    debug_info["parse_notes"].append("HTML/JSON-LD extraction found 0 products")
+
+    # 3) OCR fallback if HTML/API parsing found nothing and engine is JS-heavy
+    if js_heavy:
         st.info(
             "No products found in static HTML or API responses for this menu. "
             "Trying OCR-based screenshot parsing (Playwright / Screenshot API)…"
         )
         df_ocr = ocr_menu_from_url(url)
         if not df_ocr.empty:
+            debug_info["parse_notes"].append(
+                f"OCR fallback found {len(df_ocr)} products"
+            )
             df = df_ocr
+        else:
+            debug_info["parse_notes"].append("OCR fallback found 0 products")
 
-    return df, engine
+    return df, engine, debug_info
 
 
 # -------------------------
@@ -638,16 +704,27 @@ with st.form("scan_form"):
         "Dispensary label (for the table)",
         placeholder="Solar Somerset (Rec), NEA Fall River (Med), etc.",
     )
-    use_browser = st.checkbox(
-        "Use browser mode (Playwright) – recommended for Dutchie / JS-heavy menus",
-        value=HAS_BROWSER_HELPERS,
-        disabled=not HAS_BROWSER_HELPERS,
-        help=(
-            "Launches a headless Chromium browser that bypasses 21+ age gates "
-            "and captures live API/GraphQL responses. "
-            "Requires: playwright install chromium"
-        ),
-    )
+    col_a, col_b = st.columns(2)
+    with col_a:
+        use_browser = st.checkbox(
+            "Use browser mode (Playwright) – recommended for Dutchie / JS-heavy menus",
+            value=HAS_BROWSER_HELPERS,
+            disabled=not HAS_BROWSER_HELPERS,
+            help=(
+                "Launches a headless Chromium browser that bypasses 21+ age gates "
+                "and captures live API/GraphQL responses. "
+                "Requires: playwright install chromium"
+            ),
+        )
+    with col_b:
+        debug_mode = st.checkbox(
+            "Debug mode – show engine signals, captured responses, and parse notes",
+            value=False,
+            help=(
+                "Shows the detected engine, final URL after redirects, "
+                "number of captured JSON responses, and parsing notes."
+            ),
+        )
     submitted = st.form_submit_button("Scan & Add to Table")
 
 if submitted and url.strip():
@@ -655,7 +732,29 @@ if submitted and url.strip():
     label = dispo_name.strip() or url
 
     with st.spinner("Scanning menu and parsing products…"):
-        df, engine = fetch_competitor_menu(url, use_browser=use_browser)
+        df, engine, debug_info = fetch_competitor_menu(
+            url, use_browser=use_browser
+        )
+
+    # Always show debug panel when debug mode is on
+    if debug_mode:
+        with st.expander("🔍 Debug Info", expanded=True):
+            st.markdown(f"**Initial engine detected:** `{debug_info.get('engine_initial')}`")
+            st.markdown(f"**Final engine after browser re-detect:** `{debug_info.get('engine_final')}`")
+            st.markdown(f"**Browser (Playwright) used:** `{debug_info.get('browser_used')}`")
+            st.markdown(f"**Final URL after redirects:** `{debug_info.get('final_url')}`")
+            captured_count = debug_info.get("captured_count", 0)
+            st.markdown(f"**Captured JSON responses:** `{captured_count}`")
+            captured_urls = debug_info.get("captured_urls", [])
+            if captured_urls:
+                st.markdown("**Top captured response URLs:**")
+                for cu in captured_urls[:10]:
+                    st.code(cu)
+            parse_notes = debug_info.get("parse_notes", [])
+            if parse_notes:
+                st.markdown("**Parse notes:**")
+                for note in parse_notes:
+                    st.markdown(f"- {note}")
 
     if df.empty:
         st.warning(
@@ -664,7 +763,7 @@ if submitted and url.strip():
         )
         if engine:
             st.info(f"Detected menu engine: **{engine}**")
-            if engine in {"dutchie", "jane", "weedmaps"}:
+            if engine in {"dutchie", "jane", "weedmaps", "dispense"}:
                 st.caption(
                     "Tried HTML/JSON and OCR fallback. For precise data, you may still "
                     "need a CSV/Excel export from the platform or admin side."

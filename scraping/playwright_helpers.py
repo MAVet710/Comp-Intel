@@ -2,7 +2,7 @@
 Playwright-based browser helpers for menu scraping.
 
 Provides:
-- browser_fetch(url) -> (html, captured_json_payloads, final_url)
+- browser_fetch(url) -> (html, captured_responses, final_url)
 - try_bypass_age_gate(page) -> bool
 
 Requires playwright to be installed:  playwright install chromium
@@ -52,6 +52,22 @@ _AGE_GATE_SELECTORS = [
     "button[aria-label*='age']",
 ]
 
+# Domains/patterns for which we always capture JSON responses
+_CAPTURE_URL_PATTERNS = [
+    "dutchie",
+    "graphql",
+    "iheartjane",
+    "jane.menu",
+    "weedmaps",
+    "dispenseapp",
+    "dispense.io",
+    "tymberapp",
+    "/api/",
+    "/menu/",
+    "/products",
+    "/catalog",
+]
+
 
 def try_bypass_age_gate(page) -> bool:
     """
@@ -93,20 +109,28 @@ def try_bypass_age_gate(page) -> bool:
 def browser_fetch(url: str, timeout: int = 45000) -> tuple:
     """
     Use Playwright to navigate to *url*, attempt to bypass 21+ age gates,
-    capture Dutchie/GraphQL JSON network responses, and return the rendered HTML.
+    capture JSON network responses from API/menu/Dutchie endpoints,
+    and return the rendered HTML.
 
     Args:
         url: The target URL to navigate to.
         timeout: Navigation timeout in milliseconds (default 45 s).
 
     Returns:
-        (html, captured_json_payloads, final_url)
+        (html, captured_responses, final_url)
 
         - html (str): Fully-rendered page HTML after JS execution.
           Empty string on failure.
-        - captured_json_payloads (list[dict]): Each entry is
-          {"url": <response_url>, "data": <parsed_json>}.
-          Only Dutchie- or GraphQL-related responses are captured.
+        - captured_responses (list[dict]): Each entry is
+          {
+            "url": <response_url>,
+            "status": <http_status_int>,
+            "content_type": <content-type header>,
+            "json": <parsed JSON body or None>,
+            "text_snippet": <first 200 chars of body text or None>,
+            "data": <alias for json field – kept for backward compat>,
+          }
+          Responses are filtered to API/menu/JSON endpoints.
         - final_url (str): URL after any redirects/navigation.
     """
     if not HAS_PLAYWRIGHT:
@@ -116,18 +140,37 @@ def browser_fetch(url: str, timeout: int = 45000) -> tuple:
     html = ""
     final_url = url
 
+    def _should_capture(req_url: str, ctype: str) -> bool:
+        """Return True if this response looks like an API/menu JSON response."""
+        url_lower = req_url.lower()
+        if any(pat in url_lower for pat in _CAPTURE_URL_PATTERNS):
+            return True
+        if "json" in ctype or "graphql" in ctype:
+            return True
+        return False
+
     def _on_response(response) -> None:
-        """Capture JSON payloads from Dutchie/GraphQL endpoints."""
+        """Capture JSON payloads from API/menu endpoints."""
         req_url = response.url
-        if "dutchie" not in req_url.lower() and "graphql" not in req_url.lower():
-            return
         ctype = (response.headers.get("content-type") or "").lower()
+        if not _should_capture(req_url, ctype):
+            return
         if "json" not in ctype and "graphql" not in ctype:
             return
         try:
             body = response.json()
-            if body:
-                captured.append({"url": req_url, "data": body})
+            # Skip empty bodies — there's nothing useful to parse
+            if not body:
+                return
+            entry = {
+                "url": req_url,
+                "status": response.status,
+                "content_type": ctype,
+                "json": body,
+                "data": body,  # backward-compat alias
+                "text_snippet": None,
+            }
+            captured.append(entry)
         except Exception:
             pass
 
