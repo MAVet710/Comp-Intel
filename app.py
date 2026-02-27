@@ -632,6 +632,7 @@ def fetch_competitor_menu(
     debug_info["engine_initial"] = engine
 
     browser_payloads: list | None = None
+    final_url: str = url
 
     # -----------------------------------------------------------------------
     # Dutchie fast-path: use dedicated GraphQL crawler
@@ -675,7 +676,11 @@ def fetch_competitor_menu(
         except Exception as _bfe:
             if is_missing_browser_error(_bfe):
                 st.warning(_PLAYWRIGHT_MISSING_BINARY_WARNING)
-            bhtml, browser_payloads = "", None
+                debug_info["parse_notes"].append(
+                    "Browser mode requested but skipped: Playwright Chromium binary not found. "
+                    "Run `playwright install chromium` to enable browser mode."
+                )
+            bhtml, browser_payloads, final_url = "", None, url
         debug_info["browser_used"] = True
         debug_info["final_url"] = final_url
         if browser_payloads:
