@@ -9,6 +9,8 @@ Requires playwright to be installed:  playwright install chromium
 """
 
 import json
+import os
+import subprocess
 
 try:
     from playwright.sync_api import sync_playwright
@@ -16,6 +18,44 @@ try:
     HAS_PLAYWRIGHT = True
 except Exception:
     HAS_PLAYWRIGHT = False
+
+# Set to True once an automatic browser install has been attempted so we do
+# not re-run the install on every request.
+_playwright_install_attempted: bool = False
+
+
+def is_missing_browser_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a missing Chromium binary error."""
+    msg = str(exc).lower().replace("doesn't", "does not")
+    return "executable does not exist" in msg
+
+
+def auto_install_playwright_chromium(timeout: int = 120) -> bool:
+    """
+    Attempt to install the Playwright Chromium binary via subprocess.
+
+    Only runs when the ``AUTO_INSTALL_PLAYWRIGHT`` environment variable is set
+    to ``"true"`` (case-insensitive).  Returns True if the install command
+    exited with code 0, False otherwise.
+    """
+    global _playwright_install_attempted
+    if _playwright_install_attempted:
+        return False
+    _playwright_install_attempted = True
+
+    if os.environ.get("AUTO_INSTALL_PLAYWRIGHT", "").lower() != "true":
+        return False
+
+    try:
+        result = subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
 
 # Common confirmation text found on 21+ age gates (matched case-insensitively)
 _AGE_GATE_TEXTS = [
@@ -201,7 +241,8 @@ def browser_fetch(url: str, timeout: int = 45000) -> tuple:
         except Exception:
             pass
 
-    try:
+    def _launch_and_fetch() -> None:
+        nonlocal html, final_url
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             context = browser.new_context(
@@ -243,7 +284,22 @@ def browser_fetch(url: str, timeout: int = 45000) -> tuple:
             final_url = page.url
             html = page.content()
             browser.close()
-    except Exception:
-        html = ""
+
+    try:
+        _launch_and_fetch()
+    except Exception as exc:
+        if is_missing_browser_error(exc):
+            # Attempt one-time auto-install then retry
+            installed = auto_install_playwright_chromium()
+            if installed:
+                try:
+                    _launch_and_fetch()
+                except Exception:
+                    html = ""
+            else:
+                # Propagate so callers can surface a user-friendly message
+                raise
+        else:
+            html = ""
 
     return html, captured, final_url

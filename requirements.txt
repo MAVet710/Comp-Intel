@@ -3,6 +3,6 @@ pandas
 requests
 beautifulsoup4
 xlsxwriter
-playwright
+playwright==1.49.1
 pillow
 pytesseract
