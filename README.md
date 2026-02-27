@@ -50,6 +50,17 @@ streamlit run app.py
 5. Hit **Scan & Add to Table**.
 6. Repeat for other dispensaries, then **Download Excel**.
 
+## Streamlit Cloud Deployment
+
+When deploying to [Streamlit Community Cloud](https://streamlit.io/cloud):
+
+- The `postBuild` script at the repo root is automatically executed by Streamlit
+  Cloud during the build phase.  It runs `python -m playwright install --with-deps chromium`,
+  so **Playwright browser binaries are installed automatically** — no manual step needed.
+- `packages.txt` lists the system-level apt packages required by Chromium on the
+  Debian-based Streamlit Cloud images.  These are also installed automatically
+  during the build.
+
 ## Notes
 
 - Browser mode launches a real headless Chromium instance and makes live
