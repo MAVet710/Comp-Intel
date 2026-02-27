@@ -15,3 +15,6 @@ libpango-1.0-0
 libcairo2
 libx11-6
 libxext6
+libglib2.0-0
+ca-certificates
+fonts-liberation

@@ -21,12 +21,32 @@ except Exception:
 
 # Try to import the Playwright-based browser helpers and Dutchie parser
 try:
-    from scraping.playwright_helpers import browser_fetch, try_bypass_age_gate
+    from scraping.playwright_helpers import (
+        browser_fetch,
+        try_bypass_age_gate,
+        auto_install_playwright_chromium,
+        is_missing_browser_error,
+    )
     from scraping.dutchie_parser import parse_dutchie_responses
     from scraping.dutchie_graphql import crawl_dutchie
     HAS_BROWSER_HELPERS = True
 except Exception:
     HAS_BROWSER_HELPERS = False
+
+_PLAYWRIGHT_MISSING_BINARY_WARNING = (
+    "⚠️ **Playwright Chromium binary not found.**  \n"
+    "This usually means the `postBuild` script did not run during deployment.  \n\n"
+    "**To fix:**\n"
+    "1. Trigger a clean rebuild on Streamlit Community Cloud "
+    "(*Manage app → Reboot app* or delete and re-deploy).\n"
+    "2. Check the build logs for `postBuild` output confirming "
+    "`python -m playwright install chromium` ran successfully.\n"
+    "3. Alternatively, set the `AUTO_INSTALL_PLAYWRIGHT=true` secret in your "
+    "Streamlit Cloud app settings to enable one-time automatic installation at "
+    "runtime.\n\n"
+    "Browser-based scraping is disabled until the binary is available. "
+    "Non-browser scraping will continue."
+)
 
 # -------------------------
 # Streamlit page config
@@ -335,7 +355,10 @@ def screenshot_page_playwright(url: str) -> bytes | None:
             browser.close()
         return screenshot_bytes
     except Exception as e:
-        st.info(f"Playwright screenshot failed: {e}")
+        if HAS_BROWSER_HELPERS and is_missing_browser_error(e):
+            st.warning(_PLAYWRIGHT_MISSING_BINARY_WARNING)
+        else:
+            st.info(f"Playwright screenshot failed: {e}")
         return None
 
 
@@ -647,7 +670,12 @@ def fetch_competitor_menu(
             "Using browser mode to render page, bypass 21+ age gate, "
             "and capture API responses…"
         )
-        bhtml, browser_payloads, final_url = browser_fetch(url)
+        try:
+            bhtml, browser_payloads, final_url = browser_fetch(url)
+        except Exception as _bfe:
+            if is_missing_browser_error(_bfe):
+                st.warning(_PLAYWRIGHT_MISSING_BINARY_WARNING)
+            bhtml, browser_payloads = "", None
         debug_info["browser_used"] = True
         debug_info["final_url"] = final_url
         if browser_payloads:

@@ -1,2 +1,18 @@
-#!/bin/bash
-python -m playwright install --with-deps chromium
+#!/usr/bin/env bash
+set -euxo pipefail
+
+echo "=== postBuild: starting ==="
+echo "Working directory: $(pwd)"
+ls -la
+
+echo "=== postBuild: Python / Playwright version ==="
+python --version
+python -m playwright --version
+
+echo "=== postBuild: installing Playwright Chromium binary ==="
+python -m playwright install chromium
+
+echo "=== postBuild: installing Chromium system deps (best-effort) ==="
+python -m playwright install-deps chromium || true
+
+echo "=== postBuild: done ==="

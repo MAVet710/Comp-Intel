@@ -55,11 +55,40 @@ streamlit run app.py
 When deploying to [Streamlit Community Cloud](https://streamlit.io/cloud):
 
 - The `postBuild` script at the repo root is automatically executed by Streamlit
-  Cloud during the build phase.  It runs `python -m playwright install --with-deps chromium`,
+  Cloud during the build phase.  It runs `python -m playwright install chromium`,
   so **Playwright browser binaries are installed automatically** — no manual step needed.
 - `packages.txt` lists the system-level apt packages required by Chromium on the
   Debian-based Streamlit Cloud images.  These are also installed automatically
   during the build.
+
+### Troubleshooting: "Executable doesn't exist" at runtime
+
+If the app shows a warning that the Playwright Chromium binary is missing:
+
+1. **Check the build logs** – In the Streamlit Cloud dashboard open *Manage app →
+   Logs* (or the build log tab) and search for `postBuild`.  You should see lines
+   like:
+   ```
+   === postBuild: installing Playwright Chromium binary ===
+   Downloading Chromium ...
+   === postBuild: done ===
+   ```
+   If these lines are absent the script did not run.
+
+2. **Force a clean rebuild** – Go to *Manage app → Reboot app* (or delete and
+   re-deploy the app).  Streamlit Cloud caches the build environment; a clean
+   rebuild re-runs `postBuild`.
+
+3. **Verify the Playwright pin** – `requirements.txt` pins `playwright` to a
+   specific version.  The browser binary installed by `postBuild` must match this
+   version.  If you upgrade the pin, redeploy so `postBuild` installs the matching
+   binary.
+
+4. **Enable automatic runtime install (advanced)** – Add the secret
+   `AUTO_INSTALL_PLAYWRIGHT = true` in *Manage app → Secrets*.  When set, the
+   app will attempt a one-time `playwright install chromium` the first time a
+   missing binary is detected, then retry the browser operation.  This is a
+   safety net and should not replace a correct build setup.
 
 ## Notes
 
