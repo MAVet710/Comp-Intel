@@ -1,2 +1,4 @@
-#!/bin/bash
-python -m playwright install --with-deps chromium
+#!/usr/bin/env bash
+set -euxo pipefail
+
+python -m playwright install chromium

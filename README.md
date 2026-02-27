@@ -55,11 +55,25 @@ streamlit run app.py
 When deploying to [Streamlit Community Cloud](https://streamlit.io/cloud):
 
 - The `postBuild` script at the repo root is automatically executed by Streamlit
-  Cloud during the build phase.  It runs `python -m playwright install --with-deps chromium`,
+  Cloud during the build phase.  It runs `python -m playwright install chromium`,
   so **Playwright browser binaries are installed automatically** — no manual step needed.
 - `packages.txt` lists the system-level apt packages required by Chromium on the
   Debian-based Streamlit Cloud images.  These are also installed automatically
   during the build.
+
+### Troubleshooting Playwright on Streamlit Cloud
+
+If the app throws a missing Playwright executable error, check the build logs:
+
+1. Look for the line **`Running postBuild...`** — if it is absent, Streamlit did
+   not pick up the `postBuild` file (verify it is named exactly `postBuild` with no
+   extension and is located at the repository root).
+2. After `Running postBuild...` you should see output from
+   `python -m playwright install chromium`, including lines like
+   `Downloading Chromium ...` and `Playwright build for chromium ...`.
+3. If either of those lines is missing, the build step failed.  The script uses
+   `set -euxo pipefail` so any error will cause a loud, visible failure in the
+   build log rather than a silent no-op.
 
 ## Notes
 
