@@ -132,13 +132,15 @@ def _search_for_products(obj, depth: int = 0, max_depth: int = 8) -> list:
 
 def parse_dutchie_responses(payloads: list) -> pd.DataFrame:
     """
-    Given a list of ``{"url": str, "data": any}`` dicts captured from
-    Dutchie/GraphQL network responses, extract products and return a
-    normalised DataFrame.
+    Given a list of captured response dicts from ``browser_fetch()``,
+    extract products and return a normalised DataFrame.
+
+    Each payload may have either:
+    - ``{"url": str, "json": any, ...}``  (new richer format from browser_fetch)
+    - ``{"url": str, "data": any}``       (legacy/backward-compat format)
 
     Args:
-        payloads: Network response payloads as returned by
-                  ``browser_fetch()``.
+        payloads: Network response payloads as returned by ``browser_fetch()``.
 
     Returns:
         DataFrame with columns: Product, Category, Price, THC, Source.
@@ -149,14 +151,16 @@ def parse_dutchie_responses(payloads: list) -> pd.DataFrame:
     seen_keys: set[tuple] = set()
 
     for payload in payloads:
-        src_url = payload.get("url", "Dutchie API")
+        src_url = payload.get("url", "API")
         # Truncate long URLs to keep the Source label readable
         if len(src_url) > 60:
-            source_label = f"Dutchie API ({src_url[:57]}...)"
+            source_label = f"API ({src_url[:57]}...)"
         else:
-            source_label = f"Dutchie API ({src_url})"
+            source_label = f"API ({src_url})"
 
-        data = payload.get("data")
+        # Support both "json" (new format) and "data" (legacy format)
+        # Use explicit key check to avoid masking falsy-but-valid JSON values ([], {}, 0)
+        data = payload.get("json") if "json" in payload else payload.get("data")
         if data is None:
             continue
 
@@ -185,3 +189,7 @@ def parse_dutchie_responses(payloads: list) -> pd.DataFrame:
     df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
     df["THC"] = pd.to_numeric(df["THC"], errors="coerce")
     return df
+
+
+# Alias so callers can use the name from the problem spec
+dutchie_from_captured_responses = parse_dutchie_responses
