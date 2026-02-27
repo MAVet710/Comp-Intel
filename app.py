@@ -23,6 +23,7 @@ except Exception:
 try:
     from scraping.playwright_helpers import browser_fetch, try_bypass_age_gate
     from scraping.dutchie_parser import parse_dutchie_responses
+    from scraping.dutchie_graphql import crawl_dutchie
     HAS_BROWSER_HELPERS = True
 except Exception:
     HAS_BROWSER_HELPERS = False
@@ -45,11 +46,15 @@ Paste a **dispensary website or menu link** below.
 The app will:
 
 - Auto-detect the menu engine (**Dutchie, Jane, Weedmaps, Dispense, Tymber, or Generic**)
-- Try to scrape products (Product, Price, THC where possible) from HTML / JSON-LD
-- If that fails on JS-heavy menus (Dutchie / Jane / Weedmaps), it will try:
-  1. A **Playwright** screenshot + OCR (if supported)
-  2. A **Screenshot API** screenshot + OCR (if configured)
-- Let you scan multiple dispensaries and export everything to **Excel**
+- For **Dutchie** menus: use a full GraphQL crawler — discovers all categories,
+  paginates every page, filters to **in-stock only**, and extracts one row per
+  purchasable variant (size / weight)
+- For other JS-heavy menus: capture live API/GraphQL responses via Playwright
+- Fall back to HTML / JSON-LD parsing, then OCR screenshot if needed
+- Let you scan **MED and REC menus separately** and export everything to **Excel**
+
+> **Setup note:** Browser mode requires Playwright's Chromium binary.  
+> Run once: `playwright install chromium`
 """
 )
 
@@ -569,17 +574,17 @@ def fetch_menu_generic(url: str, html: str) -> pd.DataFrame:
 
 
 def fetch_competitor_menu(
-    url: str, use_browser: bool = False
+    url: str, use_browser: bool = False, menu_type: str | None = None
 ) -> tuple[pd.DataFrame, str | None, dict]:
     """
     Given ANY menu/website URL:
       1) Fetch HTML (static)
       2) Detect engine
-      3) If browser mode requested (or engine is JS-heavy and helpers available),
-         use Playwright to render the page, bypass 21+ gates, and capture
-         API/GraphQL network payloads.
-      4) Prefer JSON/API payload extraction (Dutchie parser) over HTML parsing.
-      5) If no products found and engine looks JS/API-heavy, try HTML parsers.
+      3) If Dutchie engine and browser helpers available, use the dedicated
+         Dutchie GraphQL crawler (full category + pagination crawl).
+      4) Otherwise, if browser mode requested or engine is JS-heavy,
+         use Playwright to render page and capture API/GraphQL payloads.
+      5) Prefer JSON/API payload extraction over HTML parsing.
       6) If still empty, try OCR fallback.
     Returns (df, engine, debug_info)
     """
@@ -591,6 +596,9 @@ def fetch_competitor_menu(
         "captured_count": 0,
         "captured_urls": [],
         "parse_notes": [],
+        "categories": [],
+        "per_page_counts": {},
+        "graphql_details": [],
     }
 
     html = fetch_html(url)
@@ -602,9 +610,39 @@ def fetch_competitor_menu(
 
     browser_payloads: list | None = None
 
-    # Engines that rely heavily on JS / API calls for menu data
+    # -----------------------------------------------------------------------
+    # Dutchie fast-path: use dedicated GraphQL crawler
+    # -----------------------------------------------------------------------
+    if engine == "dutchie" and HAS_BROWSER_HELPERS:
+        st.info(
+            "Dutchie menu detected – launching GraphQL crawler "
+            "(all categories + pages, in-stock filter)…"
+        )
+        df_dutchie, gql_debug = crawl_dutchie(url, menu_type=menu_type)
+        # Merge debug info
+        debug_info["browser_used"] = True
+        debug_info["captured_count"] = gql_debug.get("captured_count", 0)
+        debug_info["captured_urls"] = gql_debug.get("captured_urls", [])
+        debug_info["categories"] = gql_debug.get("categories", [])
+        debug_info["per_page_counts"] = gql_debug.get("per_page_counts", {})
+        debug_info["graphql_details"] = gql_debug.get("graphql_details", [])
+        debug_info["parse_notes"].extend(gql_debug.get("parse_notes", []))
+        debug_info["engine_final"] = engine
+
+        if not df_dutchie.empty:
+            debug_info["parse_notes"].append(
+                f"Dutchie GraphQL crawler found {len(df_dutchie)} rows"
+            )
+            return df_dutchie, engine, debug_info
+        debug_info["parse_notes"].append(
+            "Dutchie GraphQL crawler found 0 rows – falling back to HTML parsing"
+        )
+
+    # -----------------------------------------------------------------------
+    # Generic browser mode (non-Dutchie JS-heavy engines)
+    # -----------------------------------------------------------------------
     js_heavy = engine in {"dutchie", "jane", "weedmaps", "dispense"}
-    if (use_browser or js_heavy) and HAS_BROWSER_HELPERS:
+    if (use_browser or js_heavy) and HAS_BROWSER_HELPERS and engine != "dutchie":
         st.info(
             "Using browser mode to render page, bypass 21+ age gate, "
             "and capture API responses…"
@@ -617,14 +655,13 @@ def fetch_competitor_menu(
             debug_info["captured_urls"] = [p.get("url", "") for p in browser_payloads]
         if bhtml:
             html = bhtml
-            # Re-detect engine with the fully rendered HTML / final URL
             detected = detect_engine(final_url, html)
             if detected:
                 engine = detected
 
     debug_info["engine_final"] = engine
 
-    # 1) Prefer API/JSON payloads when available (best for Dutchie / JS-heavy menus)
+    # 1) Prefer API/JSON payloads when available (best for JS-heavy menus)
     if browser_payloads and HAS_BROWSER_HELPERS:
         df_api = parse_dutchie_responses(browser_payloads)
         if not df_api.empty:
@@ -722,78 +759,138 @@ with st.form("scan_form"):
             value=False,
             help=(
                 "Shows the detected engine, final URL after redirects, "
-                "number of captured JSON responses, and parsing notes."
+                "number of captured GraphQL responses, category list, "
+                "per-page counts, and parsing notes."
             ),
         )
+
+    st.markdown("**MED / REC options** (Dutchie menus)")
+    col_med, col_rec = st.columns(2)
+    with col_med:
+        med_url = st.text_input(
+            "MED menu URL (optional)",
+            placeholder="https://dispensary.com/menu/location/med",
+            help="Leave blank to skip. If provided, scanned separately with Menu_Type=med.",
+        )
+    with col_rec:
+        rec_url = st.text_input(
+            "REC (adult-use) menu URL (optional)",
+            placeholder="https://dispensary.com/menu/location/rec",
+            help="Leave blank to skip. If provided, scanned separately with Menu_Type=rec.",
+        )
+
     submitted = st.form_submit_button("Scan & Add to Table")
 
-if submitted and url.strip():
-    url = url.strip()
-    label = dispo_name.strip() or url
+if submitted and (url.strip() or med_url.strip() or rec_url.strip()):
+    label = dispo_name.strip() or url.strip() or med_url.strip() or rec_url.strip()
 
-    with st.spinner("Scanning menu and parsing products…"):
-        df, engine, debug_info = fetch_competitor_menu(
-            url, use_browser=use_browser
+    # Build list of (scan_url, menu_type_override) tuples
+    scan_jobs: list[tuple[str, str | None]] = []
+
+    # MED / REC specific URLs take priority
+    if med_url.strip():
+        scan_jobs.append((med_url.strip(), "med"))
+    if rec_url.strip():
+        scan_jobs.append((rec_url.strip(), "rec"))
+    # Fall back to generic URL field
+    if url.strip() and not scan_jobs:
+        scan_jobs.append((url.strip(), None))
+
+    for scan_url, menu_type_override in scan_jobs:
+        type_label = (
+            f" [{menu_type_override.upper()}]" if menu_type_override else ""
         )
-
-    # Always show debug panel when debug mode is on
-    if debug_mode:
-        with st.expander("🔍 Debug Info", expanded=True):
-            st.markdown(f"**Initial engine detected:** `{debug_info.get('engine_initial')}`")
-            st.markdown(f"**Final engine after browser re-detect:** `{debug_info.get('engine_final')}`")
-            st.markdown(f"**Browser (Playwright) used:** `{debug_info.get('browser_used')}`")
-            st.markdown(f"**Final URL after redirects:** `{debug_info.get('final_url')}`")
-            captured_count = debug_info.get("captured_count", 0)
-            st.markdown(f"**Captured JSON responses:** `{captured_count}`")
-            captured_urls = debug_info.get("captured_urls", [])
-            if captured_urls:
-                st.markdown("**Top captured response URLs:**")
-                for cu in captured_urls[:10]:
-                    st.code(cu)
-            parse_notes = debug_info.get("parse_notes", [])
-            if parse_notes:
-                st.markdown("**Parse notes:**")
-                for note in parse_notes:
-                    st.markdown(f"- {note}")
-
-    if df.empty:
-        st.warning(
-            "No products were detected from this URL, even after HTML/JSON and OCR attempts. "
-            "This menu may rely on protected APIs or complex rendering."
-        )
-        if engine:
-            st.info(f"Detected menu engine: **{engine}**")
-            if engine in {"dutchie", "jane", "weedmaps", "dispense"}:
-                st.caption(
-                    "Tried HTML/JSON and OCR fallback. For precise data, you may still "
-                    "need a CSV/Excel export from the platform or admin side."
-                )
-    else:
-        # Normalize basic columns
-        if "Price" in df.columns:
-            df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
-        if "THC" in df.columns:
-            df["THC"] = pd.to_numeric(df["THC"], errors="coerce")
-
-        df.insert(0, "Dispensary", label)
-        df["Engine"] = engine or "unknown"
-        df["Source_URL"] = url
-
-        # Append to session_state master table
-        if st.session_state["all_competitors"].empty:
-            st.session_state["all_competitors"] = df
-        else:
-            st.session_state["all_competitors"] = pd.concat(
-                [st.session_state["all_competitors"], df], ignore_index=True
+        with st.spinner(f"Scanning{type_label}: {scan_url}…"):
+            df, engine, debug_info = fetch_competitor_menu(
+                scan_url,
+                use_browser=use_browser,
+                menu_type=menu_type_override,
             )
 
-        st.success(
-            f"Added **{len(df)}** products from **{label}** "
-            f"(engine detected: **{engine or 'unknown'}**)."
-        )
+        # Always show debug panel when debug mode is on
+        if debug_mode:
+            with st.expander(f"🔍 Debug Info{type_label}", expanded=True):
+                st.markdown(f"**Initial engine detected:** `{debug_info.get('engine_initial')}`")
+                st.markdown(f"**Final engine after browser re-detect:** `{debug_info.get('engine_final')}`")
+                st.markdown(f"**Browser (Playwright) used:** `{debug_info.get('browser_used')}`")
+                st.markdown(f"**Final URL after redirects:** `{debug_info.get('final_url')}`")
 
-        with st.expander("Preview rows from this scan"):
-            st.dataframe(df.head(50), use_container_width=True)
+                captured_count = debug_info.get("captured_count", 0)
+                st.markdown(f"**Captured GraphQL responses:** `{captured_count}`")
+
+                graphql_details = debug_info.get("graphql_details", [])
+                if graphql_details:
+                    st.markdown("**Top captured GraphQL URLs:**")
+                    for gd in graphql_details[:10]:
+                        status = gd.get("status", "?")
+                        blen = gd.get("body_length")
+                        ok = "✅" if gd.get("json_ok") else "❌"
+                        blen_str = f"{blen:,} bytes" if blen else "n/a"
+                        st.code(
+                            f"{ok} HTTP {status} | {blen_str} | {gd.get('url', '')}"
+                        )
+
+                categories = debug_info.get("categories", [])
+                if categories:
+                    st.markdown(
+                        f"**Categories discovered ({len(categories)}):** "
+                        + ", ".join(f"`{c}`" for c in categories)
+                    )
+
+                per_page = debug_info.get("per_page_counts", {})
+                if per_page:
+                    st.markdown("**Per-page product counts:**")
+                    for k, v in per_page.items():
+                        st.markdown(f"- `{k}`: {v} rows")
+
+                parse_notes = debug_info.get("parse_notes", [])
+                if parse_notes:
+                    st.markdown("**Parse notes:**")
+                    for note in parse_notes:
+                        st.markdown(f"- {note}")
+
+        if df.empty:
+            st.warning(
+                f"No products detected from {scan_url}{type_label}. "
+                "The menu may rely on protected APIs or complex rendering."
+            )
+            if engine:
+                st.info(f"Detected menu engine: **{engine}**")
+                if engine in {"dutchie", "jane", "weedmaps", "dispense"}:
+                    st.caption(
+                        "Tried HTML/JSON and OCR fallback. For precise data, you may still "
+                        "need a CSV/Excel export from the platform or admin side."
+                    )
+        else:
+            # Normalize basic columns
+            if "Price" in df.columns:
+                df["Price"] = pd.to_numeric(df["Price"], errors="coerce")
+            if "THC" in df.columns:
+                df["THC"] = pd.to_numeric(df["THC"], errors="coerce")
+
+            df.insert(0, "Dispensary", label)
+            # Add Menu_Type column if not already present (e.g. from GraphQL crawler)
+            if "Menu_Type" not in df.columns:
+                df["Menu_Type"] = menu_type_override
+            df["Engine"] = engine or "unknown"
+            if "Source_URL" not in df.columns:
+                df["Source_URL"] = scan_url
+
+            # Append to session_state master table
+            if st.session_state["all_competitors"].empty:
+                st.session_state["all_competitors"] = df
+            else:
+                st.session_state["all_competitors"] = pd.concat(
+                    [st.session_state["all_competitors"], df], ignore_index=True
+                )
+
+            st.success(
+                f"Added **{len(df)}** products from **{label}**{type_label} "
+                f"(engine: **{engine or 'unknown'}**)."
+            )
+
+            with st.expander(f"Preview rows{type_label}"):
+                st.dataframe(df.head(50), use_container_width=True)
 
 st.markdown("---")
 st.subheader("Combined Competitor Table (all scans this session)")
