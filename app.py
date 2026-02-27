@@ -19,6 +19,14 @@ try:
 except Exception:
     HAS_PLAYWRIGHT = False
 
+# Try to import the Playwright-based browser helpers and Dutchie parser
+try:
+    from scraping.playwright_helpers import browser_fetch, try_bypass_age_gate
+    from scraping.dutchie_parser import parse_dutchie_responses
+    HAS_BROWSER_HELPERS = True
+except Exception:
+    HAS_BROWSER_HELPERS = False
+
 # -------------------------
 # Streamlit page config
 # -------------------------
@@ -440,24 +448,31 @@ def ocr_menu_from_url(url: str) -> pd.DataFrame:
 # -------------------------
 
 
-def fetch_menu_dutchie(url: str, html: str) -> pd.DataFrame:
+def fetch_menu_dutchie(
+    url: str, html: str, browser_payloads: list | None = None
+) -> pd.DataFrame:
     """
     Dutchie menus: either a direct dutchie.com link, or a marketing site
     that embeds Dutchie via dtche[...] / iframe.
 
-    This version does NOT call any hard-coded Dutchie API endpoint.
-    It:
-      1) Uses the HTML we already fetched
-      2) Tries JSON-LD
-      3) Falls back to generic HTML card parsing
+    Extraction priority:
+      1) Dutchie/GraphQL network payloads captured during a Playwright session
+      2) JSON-LD embedded in the HTML
+      3) Generic HTML card parsing
     """
-    dutchie_html = html
-    soup = BeautifulSoup(dutchie_html, "html.parser")
+    # 1) Prefer API payloads captured by the browser session
+    if browser_payloads and HAS_BROWSER_HELPERS:
+        df_api = parse_dutchie_responses(browser_payloads)
+        if not df_api.empty:
+            return df_api
 
-    df_ld = parse_products_from_jsonld(dutchie_html)
+    # 2) JSON-LD
+    df_ld = parse_products_from_jsonld(html)
     if not df_ld.empty:
         return df_ld
 
+    # 3) Generic HTML cards
+    soup = BeautifulSoup(html, "html.parser")
     df_cards = extract_generic_cards(soup)
     if not df_cards.empty:
         return df_cards
@@ -531,14 +546,18 @@ def fetch_menu_generic(url: str, html: str) -> pd.DataFrame:
 # -------------------------
 
 
-def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
+def fetch_competitor_menu(
+    url: str, use_browser: bool = False
+) -> tuple[pd.DataFrame, str | None]:
     """
     Given ANY menu/website URL:
-      1) Fetch HTML
+      1) Fetch HTML (static)
       2) Detect engine
-      3) Use engine-specific / generic HTML parsers
-      4) If no products found and engine looks JS/API-heavy (dutchie/jane/weedmaps),
-         try an OCR screenshot fallback.
+      3) If browser mode requested (or engine is JS-heavy and helpers available),
+         use Playwright to render the page, bypass 21+ gates, and capture
+         Dutchie/GraphQL network payloads.
+      4) Use engine-specific / generic HTML parsers
+      5) If no products found and engine looks JS/API-heavy, try OCR fallback.
     Returns (df, engine)
     """
     html = fetch_html(url)
@@ -547,9 +566,26 @@ def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
 
     engine = detect_engine(url, html)
 
-    # Step 3: normal HTML/JSON parsing
+    browser_payloads: list | None = None
+
+    # Decide whether to use the Playwright browser path
+    js_heavy = engine in {"dutchie", "jane", "weedmaps"}
+    if (use_browser or js_heavy) and HAS_BROWSER_HELPERS:
+        st.info(
+            "Using browser mode to render page, bypass 21+ age gate, "
+            "and capture API responses…"
+        )
+        bhtml, browser_payloads, final_url = browser_fetch(url)
+        if bhtml:
+            html = bhtml
+            # Re-detect engine with the fully rendered HTML / final URL
+            detected = detect_engine(final_url, html)
+            if detected:
+                engine = detected
+
+    # Engine-specific / generic HTML parsing
     if engine == "dutchie":
-        df = fetch_menu_dutchie(url, html)
+        df = fetch_menu_dutchie(url, html, browser_payloads)
     elif engine == "jane":
         df = fetch_menu_jane(url, html)
     elif engine == "weedmaps":
@@ -561,10 +597,10 @@ def fetch_competitor_menu(url: str) -> tuple[pd.DataFrame, str | None]:
     else:
         df = fetch_menu_generic(url, html)
 
-    # Step 4: OCR fallback if HTML parsing found nothing and engine is JS-heavy
-    if df.empty and engine in {"dutchie", "jane", "weedmaps"}:
+    # OCR fallback if HTML/API parsing found nothing and engine is JS-heavy
+    if df.empty and js_heavy:
         st.info(
-            "No products found in static HTML for this menu. "
+            "No products found in static HTML or API responses for this menu. "
             "Trying OCR-based screenshot parsing (Playwright / Screenshot API)…"
         )
         df_ocr = ocr_menu_from_url(url)
@@ -602,6 +638,16 @@ with st.form("scan_form"):
         "Dispensary label (for the table)",
         placeholder="Solar Somerset (Rec), NEA Fall River (Med), etc.",
     )
+    use_browser = st.checkbox(
+        "Use browser mode (Playwright) – recommended for Dutchie / JS-heavy menus",
+        value=HAS_BROWSER_HELPERS,
+        disabled=not HAS_BROWSER_HELPERS,
+        help=(
+            "Launches a headless Chromium browser that bypasses 21+ age gates "
+            "and captures live API/GraphQL responses. "
+            "Requires: playwright install chromium"
+        ),
+    )
     submitted = st.form_submit_button("Scan & Add to Table")
 
 if submitted and url.strip():
@@ -609,7 +655,7 @@ if submitted and url.strip():
     label = dispo_name.strip() or url
 
     with st.spinner("Scanning menu and parsing products…"):
-        df, engine = fetch_competitor_menu(url)
+        df, engine = fetch_competitor_menu(url, use_browser=use_browser)
 
     if df.empty:
         st.warning(
