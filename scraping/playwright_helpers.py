@@ -8,6 +8,8 @@ Provides:
 Requires playwright to be installed:  playwright install chromium
 """
 
+import json
+
 try:
     from playwright.sync_api import sync_playwright
 
@@ -152,10 +154,35 @@ def browser_fetch(url: str, timeout: int = 45000) -> tuple:
     def _on_response(response) -> None:
         """Capture JSON payloads from API/menu endpoints."""
         req_url = response.url
+        url_lower = req_url.lower()
         ctype = (response.headers.get("content-type") or "").lower()
         if not _should_capture(req_url, ctype):
             return
-        if "json" not in ctype and "graphql" not in ctype:
+
+        # For GraphQL endpoints always try text() → json.loads() so we are
+        # not gated on Content-Type being exactly 'application/json'.
+        is_graphql = "graphql" in url_lower or "operationname" in url_lower
+        if is_graphql:
+            try:
+                text = response.text()
+                body = json.loads(text)
+                if not body:
+                    return
+                entry = {
+                    "url": req_url,
+                    "status": response.status,
+                    "content_type": ctype,
+                    "json": body,
+                    "data": body,
+                    "text_snippet": text[:200],
+                }
+                captured.append(entry)
+            except Exception:
+                pass
+            return
+
+        # Non-GraphQL endpoints: require a JSON content-type
+        if "json" not in ctype:
             return
         try:
             body = response.json()
